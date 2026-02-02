@@ -15,6 +15,7 @@ import requests
 import time
 from metrics import MetricsHandler
 from typing import Dict, Optional, Tuple
+import shlex
 
 from prometheus_client import generate_latest
 
@@ -204,18 +205,56 @@ def update_repo(repo_config: RepoToWatch) -> RepoUpdateResult:
         result.git_stdout = git_result.stdout
         result.git_stderr = git_result.stderr
         result.git_exit_code = git_result.returncode
+        # Deploy using either an explicit DEPLOY_CMD or a simple docker build/run sequence
+        def try_deploy_commands(path: str, repo_name: str):
+            env_cmd = os.getenv("DEPLOY_CMD")
+            if env_cmd:
+                # allow a full command provided via env var
+                try:
+                    cmd = shlex.split(env_cmd)
+                except Exception as e:
+                    return (-1, "", f"Failed to parse DEPLOY_CMD: {e}", env_cmd)
+                try:
+                    res = subprocess.run(cmd, cwd=path, capture_output=True, text=True)
+                    return (res.returncode, res.stdout, res.stderr, " ".join(cmd))
+                except FileNotFoundError as e:
+                    return (-1, "", f"DEPLOY_CMD not found: {e}", " ".join(cmd))
+                except Exception as e:
+                    return (-1, "", str(e), " ".join(cmd))
 
-        docker_result = subprocess.run(
-            ["docker-compose", "up", "--build", "-d"],
-            cwd=repo_config.path,
-            capture_output=True,
-            text=True,
-        )
-        logger.info(f"Docker compose stdout: {docker_result.stdout}")
-        logger.info(f"Docker compose stdout: {docker_result.stderr}")
-        result.docker_stdout = docker_result.stdout
-        result.docker_stderr = docker_result.stderr
-        result.git_exit_code = git_result.returncode
+            # Default: simple docker build + run (stop/remove existing container)
+            steps = [
+                ("build", ["docker", "build", "-t", f"{repo_name}:latest", "."]),
+                ("stop", ["docker", "stop", repo_name]),
+                ("rm", ["docker", "rm", repo_name]),
+                ("run", ["docker", "run", "-d", "--name", repo_name, f"{repo_name}:latest"]),
+            ]
+
+            combined_out = []
+            combined_err = []
+            last_rc = 0
+            last_cmd = ""
+            for name, cmd in steps:
+                last_cmd = " ".join(cmd)
+                try:
+                    res = subprocess.run(cmd, cwd=path, capture_output=True, text=True)
+                    combined_out.append(f"== {name} stdout ==\n" + (res.stdout or ""))
+                    combined_err.append(f"== {name} stderr ==\n" + (res.stderr or ""))
+                    last_rc = res.returncode
+                except FileNotFoundError as e:
+                    return (-1, "", f"Docker binary not found: {e}", last_cmd)
+                except Exception as e:
+                    return (-1, "", str(e), last_cmd)
+
+            return (last_rc, "\n".join(combined_out), "\n".join(combined_err), last_cmd)
+
+        docker_exit, docker_out, docker_err, docker_cmd = try_deploy_commands(repo_config.path, repo_config.name)
+        logger.info(f"Deploy command used: {docker_cmd}")
+        logger.info(f"Deploy stdout: {docker_out}")
+        logger.info(f"Deploy stderr: {docker_err}")
+        result.docker_stdout = docker_out
+        result.docker_stderr = docker_err
+        result.docker_exit_code = docker_exit
         push_update_success_as_discord_embed(repo_config, result)
     except Exception:
         logger.exception("update_repo had a bad time")
@@ -288,7 +327,8 @@ def start_smee():
 
         process = subprocess.Popen(
             smee_cmd,
-        )
+            #shell=True,  #Windows is absolutely broken like why the hell would you even try to run this on windows 😭
+        )#if you do need to run on windows bc you run windows server like a loser then uncomment the above line to activate shell mode for windows.
         logger.info(f"smee started with PID {process.pid}")
     except Exception:
         logger.exception("Error starting smee")
